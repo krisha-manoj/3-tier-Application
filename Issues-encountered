@@ -1,0 +1,403 @@
+==========================
+Issue 
+==========================
+
+Error: checking whether serviceaccount "kube-system/aws-load-balancer-controller" exists: Get "https://7455FA8D46A570681D600CB630A1963F.gr7.us-west-2.eks.amazonaws.com/api/v1/namespaces/kube-system/serviceaccounts/aws-load-balancer-controller": dial tcp 172.31.36.118:443: i/o timeout
+
+I/O timeout connect and "couldn't get current server API group list: the server has asked for the client to provide credentials"
+
+Means : Allow EC2 instances traffic in inbound of cluster SG and Allow IAM user access entry on the cluster 
+
+Step 1:
+# 1. Get the new cluster's security group
+CLUSTER_SG=$(aws eks describe-cluster --name three-tier --region us-west-2 \
+  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" --output text)
+
+echo $CLUSTER_SG
+
+# 2. Allow all VPC traffic (avoids the node join issue from last time too)
+aws ec2 authorize-security-group-ingress --region us-west-2 \
+  --group-id $CLUSTER_SG \
+  --protocol all \
+  --cidr 172.31.0.0/16
+
+allow entire vpc cidr 
+
+Step 2 :
+
+# Add access entry
+aws eks create-access-entry --region us-west-2 \
+  --cluster-name three-tier \
+  --principal-arn arn:aws:iam::307946644949:user/oregonuser \
+  --type STANDARD
+
+kubectl get svc
+Returns output now 
+
+==========================
+Issue 1 while adding service account :
+==========================
+
+# Root Cause Analysis (RCA)
+
+## Issue Summary
+
+`eksctl create iamserviceaccount` failed on an EC2 instance attempting to communicate with an EKS cluster (`three-tier`) in `us-west-2`.
+
+---
+
+## Timeline of Errors & Fixes
+
+| # | Error | Root Cause | Fix Applied |
+|---|-------|-----------|-------------|
+| 1 | `dial tcp 172.31.36.118:443: i/o timeout` | Cluster security group not allowing inbound port 443 from EC2 | Added inbound rule to cluster SG allowing EC2's SG on port 443 |
+| 2 | `connection to localhost:8080 was refused` | No kubeconfig configured on the EC2 instance | Ran `aws eks update-kubeconfig` |
+| 3 | `Unauthorized` → `is forbidden: User cannot get resource` | IAM user `oregonuser` had no EKS access entry granting cluster permissions | Created EKS access entry with `AmazonEKSClusterAdminPolicy` |
+
+---
+
+## Root Cause Details
+
+### 1. Network — Security Group Blocking
+
+- The EKS cluster security group (`sg-06ff66425bc1d820d`) had no inbound rule for port 443 from the EC2 instance's security group (`sg-0461d60b8da98692b`)
+- Even though both were in the same VPC and subnet, the cluster SG must explicitly allow traffic
+
+### 2. Configuration — Missing kubeconfig
+
+- `kubectl` defaults to `localhost:8080` when no kubeconfig exists
+- The EC2 instance never had the kubeconfig generated for the EKS cluster
+
+### 3. Authorization — No EKS Access Entry
+
+- The IAM user (`oregonuser`) was not the identity that created the cluster (likely created via console with a different role)
+- EKS does not grant access to IAM identities by default — they must be explicitly added via access entries or `aws-auth` ConfigMap
+
+---
+
+## Fixes Applied
+
+```bash
+# Fix 1: Security group inbound rule
+aws ec2 authorize-security-group-ingress --region us-west-2 \
+  --group-id sg-06ff66425bc1d820d \
+  --protocol tcp --port 443 \
+  --source-group sg-0461d60b8da98692b
+
+# Fix 2: Generate kubeconfig
+aws eks update-kubeconfig --name three-tier --region us-west-2
+
+# Fix 3: Grant cluster admin access
+aws eks create-access-entry --region us-west-2 \
+  --cluster-name three-tier \
+  --principal-arn arn:aws:iam::307946644949:user/oregonuser \
+  --type STANDARD
+
+aws eks associate-access-policy --region us-west-2 \
+  --cluster-name three-tier \
+  --principal-arn arn:aws:iam::307946644949:user/oregonuser \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
+```
+
+---
+
+## Future Prevention Checklist
+
+When setting up a new EKS cluster and EC2 management instance, verify these before running any `kubectl`/`eksctl` commands:
+
+### 1. Network Connectivity Check
+```bash
+# Verify the cluster SG allows your EC2 on port 443
+aws ec2 describe-security-group-rules --region us-west-2 \
+  --filters "Name=group-id,Values=<cluster-sg-id>" \
+  --query "SecurityGroupRules[?ToPort==\`443\`]"
+```
+
+### 2. Kubeconfig Check
+```bash
+# Ensure kubeconfig exists and points to the right cluster
+cat ~/.kube/config
+# Or regenerate:
+aws eks update-kubeconfig --name <cluster-name> --region <region>
+```
+
+### 3. IAM Authorization Check
+```bash
+# Verify your identity
+aws sts get-caller-identity
+
+# Check if your identity has an access entry
+aws eks list-access-entries --region us-west-2 --cluster-name <cluster-name>
+
+# Quick connectivity + auth test
+kubectl get svc
+```
+
+### 4. One-liner Connectivity Diagnostic
+```bash
+# If kubectl fails, this tells you which layer is broken:
+curl -sk --connect-timeout 5 $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}') && echo "Network OK" || echo "Network BLOCKED"
+```
+
+4) Install HELM 
+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+==========================
+Issue 2 
+==========================
+
+kubectl get deployment -n kube-system aws-load-balancer-controller
+NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+aws-load-balancer-controller   0/2     2            0           12m
+
+No nodes getting provisioned 
+
+this was because the serive account (load balancer) was not getting created properly 
+
+Deployment: 0/2 Ready, 0 pods created
+ReplicaFailure: True, FailedCreate
+
+How it was identified 
+
+1	kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller	---- No pods found at all
+2	kubectl describe deployment aws-load-balancer-controller -n kube-system	---- ReplicaFailure: True, FailedCreate
+3	kubectl describe replicaset aws-load-balancer-controller-854dd5475c -n kube-system	---- Root cause: serviceaccount "aws-load-balancer-controller" not found
+
+Root Cause:
+================
+
+The Helm chart was installed with --set serviceAccount.create=false, which tells Helm to not create the ServiceAccount — expecting it to already exist. But it didn't.
+
+Why eksctl create iamserviceaccount didn't create it:
+
+The IAM role AmazonEKSLoadBalancerControllerRole already existed (from the previous cluster)
+eksctl saw the existing CloudFormation stack and said "no tasks" — skipping ServiceAccount creation
+Result: IAM role ✅ exists | Kubernetes ServiceAccount ❌ missing
+
+How We Fixed It
+================
+
+1. Manually created the ServiceAccount
+
+kubectl create serviceaccount aws-load-balancer-controller -n kube-system
+2. Annotated it with the IAM role ARN
+
+kubectl annotate serviceaccount aws-load-balancer-controller -n kube-system \
+  eks.amazonaws.com/role-arn=arn:aws:iam::307946644949:role/AmazonEKSLoadBalancerControllerRole
+3. Restarted the deployment (ReplicaSet was in failure backoff)
+
+kubectl rollout restart deployment aws-load-balancer-controller -n kube-system
+4. Verified
+
+kubectl get deployment -n kube-system aws-load-balancer-controller
+NAME                           READY   UP-TO-DATE   AVAILABLE   AGE
+aws-load-balancer-controller   2/2     2            2           12m
+
+===================
+ISSUE 3
+===================
+
+After creating ingress resource, the ALB address wasnt getting displayed 
+
+ kubectl get ingress -n robot-shop
+NAME         CLASS    HOSTS   ADDRESS   PORTS   AGE
+robot-shop   alb      *                 80      24s
+
+
+Step 1: Describe the Ingress — Check Events
+
+kubectl describe ingress robot-shop -n robot-shop
+Error found:
+
+
+Warning  FailedBuildModel  ingress  AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity
+Meaning: The controller can't assume its IAM role via IRSA.
+
+Verify OIDC Provider Exists
+
+Step 2:  eksctl utils associate-iam-oidc-provider --cluster three-tier --region us-west-2 --approve
+Result: Already associated ✅
+
+Step 3: Get Current Cluster's OIDC ID
+
+aws eks describe-cluster --name three-tier --region us-west-2 \
+  --query "cluster.identity.oidc.issuer" --output text
+Result: https://oidc.eks.us-west-2.amazonaws.com/id/1B2725ECB6084D0BF5377B816699B8C2
+
+Step 4: Check IAM Role Trust Policy
+
+aws iam get-role --role-name AmazonEKSLoadBalancerControllerRole \
+  --query "Role.AssumeRolePolicyDocument" --output json
+Finding — Mismatch:
+
+Root Cause
+The IAM role was created for a previous cluster with a different OIDC provider. When the new cluster was created, it got a new OIDC ID, but the role's trust policy was never updated. STS rejected the AssumeRoleWithWebIdentity call because the token issuer didn't match.
+
+Fix Applied
+1. Updated the Trust Policy with Correct OIDC ID
+
+cat > lb-trust-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::307946644949:oidc-provider/oidc.eks.us-west-2.amazonaws.com/id/1B2725ECB6084D0BF5377B816699B8C2"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "oidc.eks.us-west-2.amazonaws.com/id/1B2725ECB6084D0BF5377B816699B8C2:aud": "sts.amazonaws.com",
+                    "oidc.eks.us-west-2.amazonaws.com/id/1B2725ECB6084D0BF5377B816699B8C2:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller"
+                }
+            }
+        }
+    ]
+}
+EOF
+
+aws iam update-assume-role-policy \
+  --role-name AmazonEKSLoadBalancerControllerRole \
+  --policy-document file://lb-trust-policy.json
+2. Restarted the Controller
+
+kubectl rollout restart deployment aws-load-balancer-controller -n kube-system
+3. Verified
+
+kubectl get ingress -n robot-shop
+ADDRESS now shows ALB DNS name ✅
+
+======================
+ISSUE 5 - cRASHloopBackOff
+======================
+
+kubectl get pods -n robot-shop
+NAME                         READY   STATUS    RESTARTS        AGE
+cart-78b5488766-t9rld        0/1     Error     6 (3m30s ago)   24m
+catalogue-57cbbf9c85-h66gl   0/1     Error     6 (3m33s ago)   24m
+
+ubuntu@ip-172-31-25-181:~/three-tier-architecture-demo/EKS/helm$ kubectl get pods -n robot-shop
+NAME                         READY   STATUS             RESTARTS        AGE
+cart-78b5488766-t9rld        0/1     CrashLoopBackOff   6 (3m2s ago)    26m
+catalogue-57cbbf9c85-h66gl   0/1     CrashLoopBackOff   6 (2m59s ago)   26m
+
+roblem
+Three pods (cart, catalogue, user) stuck in CrashLoopBackOff with 6+ restarts while other pods were running fine.
+
+Troubleshooting Steps
+Step 1: Check Pod Logs
+
+kubectl logs cart-78b5488766-t9rld -n robot-shop --tail=20
+Error:
+
+
+ReferenceError: performance is not defined
+    at /otel-auto-instrumentation-nodejs/node_modules/@opentelemetry/core/...
+Conclusion: Crash originates from injected OpenTelemetry libraries, not the application.
+
+Step 2: Check What's Injecting the Libraries
+
+kubectl get instrumentation -n robot-shop
+→ No Instrumentation CRD found
+
+
+kubectl get deployment cart -n robot-shop -o jsonpath='{.spec.template.metadata.annotations}' | python3 -m json.tool
+→ Found annotations triggering auto-instrumentation:
+
+
+{
+    "instrumentation.opentelemetry.io/inject-nodejs": "true",
+    "instrumentation.opentelemetry.io/inject-java": "true",
+    "instrumentation.opentelemetry.io/inject-python": "true",
+    "instrumentation.opentelemetry.io/inject-dotnet": "true",
+    "cloudwatch.aws.amazon.com/auto-annotate-*": "true"
+}
+Root Cause
+The Helm chart includes annotations that trigger OpenTelemetry webhook-based auto-instrumentation. Init containers inject OpenTelemetry SDK libraries that require a newer Node.js version than what the cart, catalogue, and user containers use. The injected SDK calls performance (a global available in Node.js 16+), causing an immediate crash on older runtimes.
+
+Fix Applied
+Disabled the annotations by setting them to "false":
+
+
+kubectl patch deployment cart -n robot-shop -p '{"spec":{"template":{"metadata":{"annotations":{"instrumentation.opentelemetry.io/inject-nodejs":"false","instrumentation.opentelemetry.io/inject-java":"false","instrumentation.opentelemetry.io/inject-python":"false","instrumentation.opentelemetry.io/inject-dotnet":"false","cloudwatch.aws.amazon.com/auto-annotate-nodejs":"false","cloudwatch.aws.amazon.com/auto-annotate-java":"false","cloudwatch.aws.amazon.com/auto-annotate-python":"false","cloudwatch.aws.amazon.com/auto-annotate-dotnet":"false"}}}}}'
+
+kubectl patch deployment catalogue -n robot-shop -p '{"spec":{"template":{"metadata":{"annotations":{"instrumentation.opentelemetry.io/inject-nodejs":"false","instrumentation.opentelemetry.io/inject-java":"false","instrumentation.opentelemetry.io/inject-python":"false","instrumentation.opentelemetry.io/inject-dotnet":"false","cloudwatch.aws.amazon.com/auto-annotate-nodejs":"false","cloudwatch.aws.amazon.com/auto-annotate-java":"false","cloudwatch.aws.amazon.com/auto-annotate-python":"false","cloudwatch.aws.amazon.com/auto-annotate-dotnet":"false"}}}}}'
+
+kubectl patch deployment user -n robot-shop -p '{"spec":{"template":{"metadata":{"annotations":{"instrumentation.opentelemetry.io/inject-nodejs":"false","instrumentation.opentelemetry.io/inject-java":"false","instrumentation.opentelemetry.io/inject-python":"false","instrumentation.opentelemetry.io/inject-dotnet":"false","cloudwatch.aws.amazon.com/auto-annotate-nodejs":"false","cloudwatch.aws.amazon.com/auto-annotate-java":"false","cloudwatch.aws.amazon.com/auto-annotate-python":"false","cloudwatch.aws.amazon.com/auto-annotate-dotnet":"false"}}}}}'
+No manual pod restart needed — patching the deployment template triggers an automatic rolling update.
+
+Diagnostic Flow
+
+Pods in CrashLoopBackOff
+    ↓
+kubectl logs → Error from /otel-auto-instrumentation-nodejs/
+    ↓
+Injected library crash, not application code
+    ↓
+Check init containers → 4 OpenTelemetry init containers present
+    ↓
+Check deployment annotations → inject-* set to "true"
+    ↓
+Set annotations to "false" → Pods restart without injection → All Running ✅
+
+=================
+ISSUE 5 
+================
+
+ALB Not Reachable — Complete Analysis
+Problem Statement
+ALB was created with a DNS name but accessing it returned ERR_TIMED_OUT — the application was completely unreachable from the internet.
+
+Two Root Causes Identified
+#	Issue	Error
+1	Target pod in us-west-2d but ALB only had subnets in us-west-2a and us-west-2b	Target health: "Target.NotInUse" - Target is in an Availability Zone that is not enabled for the load balancer
+2	Cluster security group had no inbound rule allowing ALB traffic on port 8080	Target healthy but traffic still couldn't reach pods
+How We Identified the Issues
+Command 1: Check Target Health
+
+TG_ARN=$(aws elbv2 describe-target-groups --region us-west-2 \
+  --query "TargetGroups[?contains(TargetGroupName,'robotsho')].TargetGroupArn" --output text)
+
+aws elbv2 describe-target-health --region us-west-2 \
+  --target-group-arn $TG_ARN --output json
+→ Revealed: "State": "unused", "Reason": "Target.NotInUse" — AZ mismatch
+
+Command 2: Check ALB Subnets
+
+aws elbv2 describe-load-balancers --region us-west-2 \
+  --load-balancer-arns <alb-arn> \
+  --query "LoadBalancers[].AvailabilityZones" --output json
+→ Revealed: ALB only in us-west-2a and us-west-2b
+
+Command 3: Check Cluster SG Rules
+
+aws eks describe-cluster --name three-tier --region us-west-2 \
+  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" --output text
+
+aws ec2 describe-security-group-rules --region us-west-2 \
+  --filters "Name=group-id,Values=sg-00e9a43e7d355558c" --output table
+→ Revealed: No inbound rule from ALB SG to pods on port 8080
+
+Fixes Applied
+Fix 1: Add Missing AZ Subnet to ALB
+
+aws ec2 create-tags --region us-west-2 \
+  --resources subnet-04d719cd2553f7866 \
+  --tags Key=kubernetes.io/cluster/three-tier,Value=shared \
+         Key=kubernetes.io/role/elb,Value=1
+
+aws elbv2 set-subnets --region us-west-2 \
+  --load-balancer-arn <alb-arn> \
+  --subnets subnet-0ee0b4a6f0fb1dfbd subnet-032fbfdd0d88c4f27 subnet-04d719cd2553f7866
+Fix 2: Allow ALB to Reach Pods
+
+aws ec2 authorize-security-group-ingress --region us-west-2 \
+  --group-id sg-00e9a43e7d355558c \
+  --protocol tcp \
+  --port 8080 \
+  --source-group sg-03d0f9216d6531572
+
